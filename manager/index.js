@@ -18,6 +18,7 @@ const { spawn, spawnSync } = require('child_process');
 const httpProxy = require('http-proxy');
 const crypto = require('crypto');
 const { serveIndex, injectIntoHead } = require('../proxy/upstream-token.js');
+const { attachBodyTransform } = require('../proxy/compression.js');
 
 // ── 端口与环境 ────────────────────────────────────────────────
 const DSH_PORT = Number(process.env.DSH_PORT) || 3079;
@@ -325,54 +326,31 @@ const proxy = httpProxy.createProxyServer({ target: TARGET_ORIGIN, ws: true, cha
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] || '');
-  if (proxyRes.headers['content-encoding']) return;
-  if (ct.includes('text/html')) {
-    delete proxyRes.headers['content-length'];
-    res.removeHeader('content-length');
-    let injected = false;
-    const origWrite = res.write.bind(res);
-    res.write = function (chunk, ...rest) {
-      if (!injected) {
-        injected = true;
-        let str = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
-        const i = str.toLowerCase().indexOf('<head');
-        if (i !== -1) {
-          const e = str.indexOf('>', i);
-          str = e !== -1 ? str.slice(0, e + 1) + HTML_INJECT + str.slice(e + 1) : HTML_INJECT + str;
-        } else {
-          str = HTML_INJECT + str;
-        }
-        chunk = Buffer.from(str);
-      }
-      return origWrite(chunk, ...rest);
-    };
-    return;
-  }
-  if (ct.includes('javascript')) {
-    delete proxyRes.headers['content-length'];
-    res.removeHeader('content-length');
-    const chunks = [];
-    const origWrite = res.write.bind(res);
-    const origEnd = res.end.bind(res);
-    res.write = function (chunk, ...rest) {
-      if (chunk !== undefined && chunk !== null) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      return true;
-    };
-    res.end = function (chunk, ...rest) {
-      if (chunk !== undefined && chunk !== null) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      res.write = origWrite;
-      res.end = origEnd;
-      let body = Buffer.concat(chunks).toString('utf8');
-      if (body.includes(LOOPBACK_JS_NEEDLE)) body = body.split(LOOPBACK_JS_NEEDLE).join(LOOPBACK_JS_REPLACEMENT);
-      origEnd(Buffer.from(body), ...rest);
-    };
-  }
+  const isHtml = ct.includes('text/html');
+  const isJs = ct.includes('javascript');
+  if (!isHtml && !isJs) return;
+
+  // 兼容浏览器/上游的所有压缩形态（gzip / deflate / br，以及不压缩的 identity）：
+  // 缓冲整个响应体 → 按 Content-Encoding 解压成明文 → 完成 HTML/JS 改写 → 再按原编码
+  // 重压回传。这样无论上游是否开启压缩、压缩成哪种格式，下面的改写逻辑都能生效。
+  // （上一版做法是转发时剥离 Accept-Encoding 强制上游返回明文，这里不再依赖该前提）
+  attachBodyTransform(res, proxyRes, plain => {
+    const text = plain.toString('utf8');
+    if (isHtml) {
+      // HTML：注入 polyfill 与「管理」悬浮按钮
+      return Buffer.from(injectIntoHead(text, HTML_INJECT));
+    }
+    // JS：仅当命中目标判定串时才改写（未命中返回 null → 原样透传，不做无谓重压）
+    if (text.includes(LOOPBACK_JS_NEEDLE)) {
+      return Buffer.from(text.split(LOOPBACK_JS_NEEDLE).join(LOOPBACK_JS_REPLACEMENT));
+    }
+    return null;
+  });
 });
 function alignOrigin(req) {
   if (req.headers.origin) req.headers.origin = TARGET_ORIGIN;
-  // 上游开启 gzip 时，压缩响应会让 proxyRes 的 content-encoding 短路，
-  // isLoopbackHostname(...) 改写与 polyfill 注入失效；强制上游返回明文。
-  delete req.headers['accept-encoding'];
+  // 注意：不再剥离 Accept-Encoding。上游无论是否压缩（gzip/deflate/br 均可），
+  // proxyRes 的压缩兼容管线都会「解压 → 改写 → 重压」，保留带宽收益。
 }
 
 // ── 管理员页面 ───────────────────────────────────────────────

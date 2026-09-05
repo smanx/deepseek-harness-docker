@@ -2,6 +2,7 @@ const http = require('http');
 const httpProxy = require('http-proxy');
 const crypto = require('crypto');
 const { serveIndex, injectIntoHead } = require('./upstream-token.js');
+const { attachBodyTransform } = require('./compression.js');
 
 // 源端口（DSH 监听端口，默认 3079）与代理端口（代理对外监听端口，默认 3080）。
 // 两者必须不同（同一端口只能被一个进程监听），均可通过环境变量覆盖：
@@ -77,69 +78,35 @@ const LOOPBACK_JS_REPLACEMENT = 'true';
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] || '');
-  if (proxyRes.headers['content-encoding']) return;
+  const isHtml = ct.includes('text/html');
+  const isJs = ct.includes('javascript');
+  if (!isHtml && !isJs) return;
 
-  if (ct.includes('text/html')) {
-    delete proxyRes.headers['content-length'];
-    res.removeHeader('content-length');
-    let injected = false;
-    const origWrite = res.write.bind(res);
-    res.write = function (chunk, ...rest) {
-      if (!injected) {
-        injected = true;
-        let str = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
-        const i = str.toLowerCase().indexOf('<head');
-        if (i !== -1) {
-          const e = str.indexOf('>', i);
-          str = e !== -1 ? str.slice(0, e + 1) + POLYFILL + str.slice(e + 1) : POLYFILL + str;
-        } else {
-          str = POLYFILL + str;
-        }
-        chunk = Buffer.from(str);
-      }
-      return origWrite(chunk, ...rest);
-    };
-    return;
-  }
-
-  if (ct.includes('javascript')) {
-    // 缓冲整个 JS 响应做字符串改写（仅当命中目标判定串时才改写）。
-    // 覆盖任意 JS（客户端连接插件独立文件或打进主 bundle 的版本都适用）。
-    delete proxyRes.headers['content-length'];
-    res.removeHeader('content-length');
-    const chunks = [];
-    const origWrite = res.write.bind(res);
-    const origEnd = res.end.bind(res);
-    res.write = function (chunk, ...rest) {
-      if (chunk !== undefined && chunk !== null) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      return true;
-    };
-    res.end = function (chunk, ...rest) {
-      if (chunk !== undefined && chunk !== null) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      res.write = origWrite;
-      res.end = origEnd;
-      let body = Buffer.concat(chunks).toString('utf8');
-      if (body.includes(LOOPBACK_JS_NEEDLE)) {
-        body = body.split(LOOPBACK_JS_NEEDLE).join(LOOPBACK_JS_REPLACEMENT);
-      }
-      origEnd(Buffer.from(body), ...rest);
-    };
-  }
+  // 兼容浏览器/上游的所有压缩形态（gzip / deflate / br，以及不压缩的 identity）：
+  // 缓冲整个响应体 → 按 Content-Encoding 解压成明文 → 完成 HTML/JS 改写 → 再按原编码
+  // 重压回传。这样无论上游是否开启压缩、压缩成哪种格式，下面的改写逻辑都能生效。
+  // （上一版做法是转发时剥离 Accept-Encoding 强制上游返回明文，这里不再依赖该前提）
+  attachBodyTransform(res, proxyRes, plain => {
+    const text = plain.toString('utf8');
+    if (isHtml) {
+      // HTML：注入 crypto.randomUUID polyfill
+      return Buffer.from(injectIntoHead(text, POLYFILL));
+    }
+    // JS：仅当命中目标判定串时才改写（未命中返回 null → 原样透传，不做无谓重压）
+    if (text.includes(LOOPBACK_JS_NEEDLE)) {
+      return Buffer.from(text.split(LOOPBACK_JS_NEEDLE).join(LOOPBACK_JS_REPLACEMENT));
+    }
+    return null;
+  });
 });
 
 // changeOrigin 把 Host 改写为目标地址，浏览器带的 Origin 需同步对齐，
 // 否则 DSH 的 /api 同源校验(Origin 必须等于它看到的 Host)会拒绝(403)，
 // WS 握手同样走该校验。
-// 同时摘掉 Accept-Encoding：上游开启 gzip 时 JS/HTML 响应被压缩，proxyRes
-// 里对 content-encoding 的短路会导致 isLoopbackHostname(...) 改写和 polyfill
-// 注入全部失效（设置页面在非回环访问下被隐藏）。强制上游返回明文，保证改写生效。
+// 注意：不再剥离 Accept-Encoding。上游无论是否压缩（gzip/deflate/br 均可），
+// proxyRes 的压缩兼容管线都会「解压 → 改写 → 重压」，保留带宽收益。
 function alignOrigin(req) {
   if (req.headers.origin) req.headers.origin = TARGET_ORIGIN;
-  delete req.headers['accept-encoding'];
 }
 
 const server = http.createServer((req, res) => {
