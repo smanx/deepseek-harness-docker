@@ -370,6 +370,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 });
 function alignOrigin(req) {
   if (req.headers.origin) req.headers.origin = TARGET_ORIGIN;
+  // 上游开启 gzip 时，压缩响应会让 proxyRes 的 content-encoding 短路，
+  // isLoopbackHostname(...) 改写与 polyfill 注入失效；强制上游返回明文。
+  delete req.headers['accept-encoding'];
 }
 
 // ── 管理员页面 ───────────────────────────────────────────────

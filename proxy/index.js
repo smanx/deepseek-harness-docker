@@ -134,8 +134,12 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 // changeOrigin 把 Host 改写为目标地址，浏览器带的 Origin 需同步对齐，
 // 否则 DSH 的 /api 同源校验(Origin 必须等于它看到的 Host)会拒绝(403)，
 // WS 握手同样走该校验。
+// 同时摘掉 Accept-Encoding：上游开启 gzip 时 JS/HTML 响应被压缩，proxyRes
+// 里对 content-encoding 的短路会导致 isLoopbackHostname(...) 改写和 polyfill
+// 注入全部失效（设置页面在非回环访问下被隐藏）。强制上游返回明文，保证改写生效。
 function alignOrigin(req) {
   if (req.headers.origin) req.headers.origin = TARGET_ORIGIN;
+  delete req.headers['accept-encoding'];
 }
 
 const server = http.createServer((req, res) => {
