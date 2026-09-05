@@ -5,6 +5,7 @@
   "description": "DSH 管理服务（admin 变体）：页面安装/切换 DSH 版本、配置 npm 源、托管 DSH 进程并反向代理",
   "main": "index.js",
   "dependencies": {
-    "http-proxy": "^1.18.1"
+    "http-proxy": "^1.18.1",
+    "ws": "^8.18.3"
   }
 }

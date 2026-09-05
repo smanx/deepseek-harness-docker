@@ -15,8 +15,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { createRequire } = require('module');
 const httpProxy = require('http-proxy');
 const crypto = require('crypto');
+const { WebSocketServer } = require('ws');
 const { serveIndex, injectIntoHead } = require('../proxy/upstream-token.js');
 const { attachBodyTransform } = require('../proxy/compression.js');
 
@@ -44,6 +46,9 @@ const AUTH_USER = process.env.PROXY_USERNAME || '';
 const AUTH_PASS = process.env.PROXY_PASSWORD || '';
 const AUTH_REALM = 'dsh-admin';
 const PUBLIC_PATHS = new Set(['/manifest.webmanifest', '/favicon.svg', '/favicon.ico']);
+const TERMINAL_PATH = '/__admin/api/terminal';
+const TERMINAL_MAX_SESSIONS = 4;
+const TERMINAL_IDLE_MS = 30 * 60 * 1000;
 
 // ── 状态（含 npm 源配置）─────────────────────────────────────
 let state = loadState();
@@ -99,7 +104,7 @@ function bootDsh() {
     dshReady = false;
     const env = {
       ...process.env,
-      PATH: `${path.join(INSTALL_DIR, 'bin')}:${process.env.PATH || ''}`,
+      PATH: `${path.join(INSTALL_DIR, 'bin')}${path.delimiter}${process.env.PATH || ''}`,
       NPM_CONFIG_REGISTRY: effectiveRegistry(),
     };
     console.log(`[manager] 启动 DSH: ${DSH_BIN} web --port ${DSH_PORT}`);
@@ -312,6 +317,281 @@ function rejectUpgrade(socket) {
   socket.end(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${AUTH_REALM}"\r\nConnection: close\r\n\r\n`);
 }
 
+// ── 容器终端（管理员页同源 WebSocket）──────────────────────────
+// 终端使用带 stdin/stdout 的交互式 shell。管理页关闭或断开连接时，
+// 服务端会结束对应进程，避免留下孤儿 shell/命令。
+const terminalWss = new WebSocketServer({
+  noServer: true,
+  clientTracking: false,
+  maxPayload: 64 * 1024,
+});
+const terminalSessions = new Set();
+let ptyModule = null;
+
+function loadPty() {
+  if (ptyModule) return ptyModule;
+  const candidates = [];
+  // The admin image gets node-pty as a transitive DSH dependency. Resolving
+  // from DSH's package keeps the manager package small and works after a
+  // version is installed from the admin page as well.
+  if (fs.existsSync(DSH_PKG_JSON)) {
+    try { candidates.push(createRequire(DSH_PKG_JSON)('node-pty')); } catch {}
+  }
+  try { candidates.push(require('node-pty')); } catch {}
+  ptyModule = candidates.find(Boolean) || null;
+  return ptyModule;
+}
+
+function terminalShell() {
+  const configured = String(process.env.TERMINAL_SHELL || '').trim();
+  if (configured && (process.platform === 'win32' || fs.existsSync(configured))) return configured;
+  if (process.platform === 'win32') return process.env.ComSpec || 'cmd.exe';
+  for (const candidate of ['/bin/bash', '/bin/sh']) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return 'sh';
+}
+
+function terminalCwd() {
+  const candidates = [
+    process.env.TERMINAL_CWD,
+    process.env.HOME,
+    '/root',
+    process.cwd(),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      if (fs.statSync(candidate).isDirectory()) return path.resolve(candidate);
+    } catch {}
+  }
+  return process.cwd();
+}
+
+function sendTerminal(ws, payload) {
+  if (!ws || ws.readyState !== 1) return false; // WebSocket.OPEN
+  try {
+    ws.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killTerminalProcess(child, signal = 'SIGTERM') {
+  if (!child || child.killed) return;
+  try {
+    // detached creates a process group on POSIX so commands started by the shell
+    // are collected together when the browser disconnects.
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch {}
+  }
+}
+
+function killTerminalSession(session) {
+  if (!session || !session.process) return;
+  const processHandle = session.process;
+  if (session.backend === 'pty') {
+    try { processHandle.kill(signalForPty()); } catch {}
+    return;
+  }
+  killTerminalProcess(processHandle);
+}
+
+function signalForPty() {
+  // node-pty accepts the same signal names as ChildProcess on POSIX. Windows
+  // ignores the argument, but keeping one call path makes cleanup idempotent.
+  return 'SIGTERM';
+}
+
+function closeTerminalSession(session, reason = 'closed') {
+  if (!session || session.closed) return;
+  session.closed = true;
+  terminalSessions.delete(session);
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  if (!session.exited) killTerminalSession(session);
+  if (session.ws && session.ws.readyState === 1) {
+    try { session.ws.close(1000, String(reason).slice(0, 120)); } catch {}
+  }
+}
+
+function armTerminalIdleTimer(session) {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleTimer = setTimeout(() => {
+    sendTerminal(session.ws, { type: 'error', message: '终端因长时间空闲已断开' });
+    closeTerminalSession(session, 'idle timeout');
+  }, TERMINAL_IDLE_MS);
+  if (typeof session.idleTimer.unref === 'function') session.idleTimer.unref();
+}
+
+function startTerminalSession(ws) {
+  if (terminalSessions.size >= TERMINAL_MAX_SESSIONS) {
+    sendTerminal(ws, { type: 'error', message: '终端连接数已达上限，请稍后再试' });
+    try { ws.close(1013, 'too many terminals'); } catch {}
+    return;
+  }
+
+  const shell = terminalShell();
+  const cwd = terminalCwd();
+  const env = {
+    ...process.env,
+    // Keep the managed DSH CLI available from the terminal as well. The admin
+    // variant installs it under INSTALL_DIR rather than /usr/local/bin.
+    PATH: `${path.join(INSTALL_DIR, 'bin')}${path.delimiter}${process.env.PATH || ''}`,
+    TERM: process.env.TERM || 'xterm-256color',
+    COLORTERM: process.env.COLORTERM || 'truecolor',
+    NPM_CONFIG_REGISTRY: effectiveRegistry(),
+    PAGER: 'cat',
+    GIT_PAGER: 'cat',
+    PS1: process.env.TERMINAL_PS1 || '\\w $ ',
+    PROMPT_COMMAND: '',
+  };
+  const shellArgs = process.platform === 'win32'
+    ? []
+    : (path.basename(shell) === 'bash' ? ['--noprofile', '--norc', '-i'] : ['-i']);
+  let processHandle = null;
+  let backend = 'pipe';
+  const pty = loadPty();
+  if (pty && typeof pty.spawn === 'function') {
+    try {
+      processHandle = pty.spawn(shell, shellArgs, {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 32,
+        cwd,
+        env,
+        useConpty: process.platform === 'win32',
+      });
+      backend = 'pty';
+    } catch (e) {
+      console.warn(`[manager] node-pty 启动失败，回退管道 shell: ${e.message}`);
+    }
+  }
+  if (!processHandle) {
+    try {
+      processHandle = spawn(shell, shellArgs, {
+        cwd,
+        env,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      sendTerminal(ws, { type: 'error', message: `启动 shell 失败: ${e.message}` });
+      try { ws.close(1011, 'shell failed'); } catch {}
+      return;
+    }
+  }
+
+  const session = { ws, process: processHandle, backend, shell, cwd, idleTimer: null, exited: false, closed: false };
+  terminalSessions.add(session);
+  armTerminalIdleTimer(session);
+
+  const forward = (chunk) => {
+    if (session.closed) return;
+    // Do not let a noisy command grow ws' internal send queue without bound.
+    if (ws.bufferedAmount > 2 * 1024 * 1024) {
+      sendTerminal(ws, { type: 'error', message: '终端输出过多，连接已断开' });
+      return closeTerminalSession(session, 'output limit');
+    }
+    const data = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    if (!sendTerminal(ws, { type: 'output', data })) {
+      closeTerminalSession(session, 'send failed');
+    }
+  };
+  if (backend === 'pty') {
+    processHandle.onData(forward);
+    processHandle.onExit((event) => {
+      session.exited = true;
+      sendTerminal(ws, { type: 'exit', code: event && event.exitCode != null ? event.exitCode : null, signal: event && event.signal != null ? event.signal : null });
+      closeTerminalSession(session, 'shell exited');
+    });
+  } else {
+    processHandle.stdout.on('data', forward);
+    processHandle.stderr.on('data', forward);
+    processHandle.on('error', (e) => {
+      sendTerminal(ws, { type: 'error', message: `shell 错误: ${e.message}` });
+      closeTerminalSession(session, 'shell error');
+    });
+    processHandle.on('exit', (code, signal) => {
+      session.exited = true;
+      sendTerminal(ws, { type: 'exit', code, signal });
+      closeTerminalSession(session, 'shell exited');
+    });
+  }
+
+  ws.on('message', (raw) => {
+    if (session.closed) return;
+    armTerminalIdleTimer(session);
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
+    if (Buffer.byteLength(text, 'utf8') > 48 * 1024) {
+      sendTerminal(ws, { type: 'error', message: '单次输入不能超过 48 KiB' });
+      return;
+    }
+    let message;
+    try { message = JSON.parse(text); } catch { message = { type: 'input', data: text }; }
+    if (!message || typeof message !== 'object') return;
+    if (message.type === 'close') return closeTerminalSession(session, 'client requested');
+    if (message.type === 'resize') {
+      if (session.backend !== 'pty' || typeof processHandle.resize !== 'function') return;
+      const cols = Math.max(20, Math.min(300, Math.floor(Number(message.cols)) || 120));
+      const rows = Math.max(5, Math.min(100, Math.floor(Number(message.rows)) || 32));
+      try { processHandle.resize(cols, rows); } catch {}
+      return;
+    }
+    if (message.type !== 'input') return;
+    const input = String(message.data == null ? '' : message.data);
+    if (!input) return;
+    try {
+      if (session.backend === 'pty') processHandle.write(input);
+      else if (processHandle.stdin && !processHandle.stdin.destroyed && processHandle.stdin.writable) processHandle.stdin.write(input);
+      else return;
+    } catch (e) {
+      sendTerminal(ws, { type: 'error', message: `写入 shell 失败: ${e.message}` });
+      closeTerminalSession(session, 'stdin failed');
+    }
+  });
+  ws.on('close', () => closeTerminalSession(session, 'client disconnected'));
+  ws.on('error', () => closeTerminalSession(session, 'socket error'));
+  sendTerminal(ws, { type: 'ready', cwd, shell: path.basename(shell), backend });
+}
+
+function terminalOriginAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // command-line WebSocket clients generally omit Origin
+  try {
+    const parsed = new URL(origin);
+    return parsed.host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+function rejectTerminalUpgrade(socket, code, message) {
+  const body = `${message}\n`;
+  socket.end(
+    `HTTP/1.1 ${code} ${message}\r\n` +
+    'Connection: close\r\n' +
+    'Content-Type: text/plain; charset=utf-8\r\n' +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+}
+
+function handleTerminalUpgrade(req, socket, head) {
+  if (!terminalOriginAllowed(req)) return rejectTerminalUpgrade(socket, 403, 'Forbidden origin');
+  if (terminalSessions.size >= TERMINAL_MAX_SESSIONS) {
+    return rejectTerminalUpgrade(socket, 429, 'Too many terminal sessions');
+  }
+  try {
+    terminalWss.handleUpgrade(req, socket, head, (ws) => startTerminalSession(ws));
+  } catch (e) {
+    try { socket.destroy(); } catch {}
+    console.error('[manager] 终端 WebSocket 升级失败:', e.message);
+  }
+}
+
 // ── 反向代理（复用旧代理逻辑）────────────────────────────────
 // crypto.randomUUID polyfill：局域网 IP 是非安全上下文，DSH 前端依赖该 API 生成 rpcId
 const POLYFILL = '<script>(function(){try{if(typeof crypto!=="undefined"&&crypto&&typeof crypto.randomUUID!=="function"){crypto.randomUUID=function(){var b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h="";for(var i=0;i<16;i++){h+=b[i].toString(16).padStart(2,"0")}return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20)}}}catch(e){}})();</script>';
@@ -464,6 +744,9 @@ const server = http.createServer(async (req, res) => {
 
 server.on('upgrade', (req, socket, head) => {
   if (!checkAuth(req)) return rejectUpgrade(socket);
+  let pathname;
+  try { pathname = new URL(req.url || '/', `http://${req.headers.host || 'admin'}`).pathname; } catch {}
+  if (pathname === TERMINAL_PATH) return handleTerminalUpgrade(req, socket, head);
   if (!dshReady) {
     socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
     return;
@@ -493,6 +776,8 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 async function shutdown() {
   console.log('[manager] 收到退出信号，停止 DSH ...');
+  for (const session of [...terminalSessions]) closeTerminalSession(session, 'server shutdown');
+  try { terminalWss.close(); } catch {}
   await stopDsh();
   process.exit(0);
 }
