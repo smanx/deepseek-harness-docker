@@ -57,6 +57,13 @@ function lastMatch(text, regex) {
   return last;
 }
 
+// token 去敏：仅保留头尾 4 个字符，中间用 * 填充，便于日志排查又不泄露完整 token
+function maskToken(t) {
+  const s = String(t || '');
+  if (s.length <= 8) return s ? s.slice(0, 1) + '****' : '(empty)';
+  return s.slice(0, 4) + '****' + s.slice(-4);
+}
+
 // 从日志文本中提取最新（末尾）的 launch token
 function extractFromText(text) {
   if (PATTERN) {
@@ -212,9 +219,9 @@ async function serveIndex(req, res, ctx) {
     return false;
   }
   if (first.status === 401) {
-    console.log(`[upstream-token] 根目录首次请求返回 ${first.status}，尝试携带 launch token 重发以换取会话 cookie`);
     const token = ensureToken();
     if (token) {
+      console.log(`[upstream-token] 根目录首次请求返回 401，尝试携带 launch token（${maskToken(token)}）重发以换取会话 cookie`);
       // 官方格式：把 launch token 追加进根目录 URL 的 query，换取上游会话 cookie
       const sep = reqUrl.includes('?') ? '&' : '?';
       const authUrl = `${reqUrl}${sep}${TOKEN_QUERY_KEY}=${encodeURIComponent(token)}`;
@@ -223,6 +230,9 @@ async function serveIndex(req, res, ctx) {
       if (retry) {
         const sc = retry.setCookies.length;
         console.log(`[upstream-token] 携带 token 重发 → 上游返回 ${retry.status}，下发 ${sc} 个会话 cookie`);
+        if (retry.status === 401) {
+          console.log(`[upstream-token] 自动登录失败：携带 launch token（${maskToken(token)}）重发仍返回 401（token 可能已过期/失效，或该上游版本不支持 query token 方式）`);
+        }
         return sendRaw(retry, res, transformHtml);
       }
       console.log('[upstream-token] 携带 token 重发失败（网络异常或上游无响应），回退透传首次 401');
