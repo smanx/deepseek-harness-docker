@@ -85,6 +85,34 @@
     height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;
   }
   .log .err{color:var(--err)}
+  /* 容器终端 */
+  container-terminal{display:block}
+  .terminal-panel{display:flex;flex-direction:column;gap:10px}
+  .terminal-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .terminal-cwd-label{color:var(--mut);font-size:12px}
+  .terminal-cwd{
+    flex:1;min-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    color:var(--txt);font:12px ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+  }
+  .terminal-output{
+    height:320px;overflow:auto;margin:0;padding:14px 16px;background:#0b1220;
+    border:1px solid #1c2a40;border-radius:10px;color:#d7e2f2;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+    white-space:pre-wrap;word-break:break-word;tab-size:2;
+  }
+  .terminal-input-row{display:flex;align-items:center;gap:8px}
+  .terminal-prompt{color:var(--acc);font:600 14px ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}
+  .terminal-input{
+    flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:10px;padding:9px 12px;font:13px ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;outline:none;
+  }
+  .terminal-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}
+  .terminal-hint{margin-top:0}
+  @media (max-width:720px){
+    .terminal-output{height:260px}
+    .terminal-input-row{align-items:stretch}
+    .terminal-input-row button{padding-left:13px;padding-right:13px}
+  }
   /* 其他 */
   a.back{color:var(--acc);text-decoration:none;font-weight:600}
   a.back:hover{text-decoration:underline}
@@ -162,6 +190,14 @@
 
   <div class="card">
     <div class="card-head">
+      <h2 data-i18n="terminalTitle">容器终端</h2>
+      <span id="terminalStatus" class="badge warn" data-i18n="terminalConnecting">连接中</span>
+    </div>
+    <container-terminal id="containerTerminal"></container-terminal>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
       <h2 data-i18n="logTitle">安装日志（实时）</h2>
       <button id="btnClearLog" class="ghost" data-i18n="btnClearLog">清空</button>
     </div>
@@ -184,6 +220,9 @@
       regTitle: 'npm 源（NPM_CONFIG_REGISTRY）', regPlaceholder: '加载中...', btnRegUseDef: '使用默认值', btnRegSave: '保存',
       regHintLoading: '加载中...',
       verTitle: 'DSH 版本', verLoading: '加载版本列表中...', btnInstall: '安装 / 切换版本', btnRefreshVer: '刷新列表', verHint: '安装或切换后会自动启动 DSH。',
+      terminalTitle: '容器终端', terminalConnecting: '连接中', terminalConnected: '已连接', terminalDisconnected: '未连接', terminalError: '连接错误',
+      terminalCwd: '工作目录', terminalConnect: '连接', terminalDisconnect: '断开', terminalClear: '清空', terminalRun: '执行',
+      terminalPlaceholder: '输入命令并按 Enter 执行', terminalHint: '命令将在容器内以当前用户执行。', terminalExit: 'shell 已退出',
       logTitle: '安装日志（实时）', btnClearLog: '清空',
       badgeInstalling: '安装中', badgeRunning: '运行中', badgeNotRun: '未运行', badgeNotInstalled: '未安装',
       stSelectedPrefix: '已选 ', runYes: '运行中', runNo: '已停止',
@@ -211,6 +250,9 @@
       regTitle: 'npm registry (NPM_CONFIG_REGISTRY)', regPlaceholder: 'Loading...', btnRegUseDef: 'Use default', btnRegSave: 'Save',
       regHintLoading: 'Loading...',
       verTitle: 'DSH Version', verLoading: 'Loading versions...', btnInstall: 'Install / Switch', btnRefreshVer: 'Refresh list', verHint: 'DSH will start automatically after install or switch.',
+      terminalTitle: 'Container terminal', terminalConnecting: 'Connecting', terminalConnected: 'Connected', terminalDisconnected: 'Disconnected', terminalError: 'Connection error',
+      terminalCwd: 'Working directory', terminalConnect: 'Connect', terminalDisconnect: 'Disconnect', terminalClear: 'Clear', terminalRun: 'Run',
+      terminalPlaceholder: 'Enter a command and press Enter', terminalHint: 'Commands run inside the container as the current user.', terminalExit: 'Shell exited',
       logTitle: 'Install log (live)', btnClearLog: 'Clear',
       badgeInstalling: 'Installing', badgeRunning: 'Running', badgeNotRun: 'Not running', badgeNotInstalled: 'Not installed',
       stSelectedPrefix: 'Selected ', runYes: 'Running', runNo: 'Stopped',
@@ -245,6 +287,234 @@
     return s;
   }
 
+  // ── 容器终端组件 ────────────────────────────────────────────
+  // 使用 light DOM 让现有页面主题和语言切换逻辑可以直接作用于组件内容。
+  if (window.customElements && !window.customElements.get('container-terminal')) {
+    class ContainerTerminal extends HTMLElement {
+      constructor(){
+        super();
+        this.ws = null;
+        this.pendingInput = [];
+        this.resizeObserver = null;
+        this.resizeHandler = null;
+        this.statusKey = 'terminalConnecting';
+        this.statusClass = 'warn';
+        this.statusText = null;
+      }
+      connectedCallback(){
+        this.innerHTML = `
+          <div class="terminal-panel">
+            <div class="terminal-toolbar">
+              <span class="terminal-cwd-label" data-i18n="terminalCwd">工作目录</span>
+              <code class="terminal-cwd" data-terminal-cwd title=""></code>
+              <button type="button" class="ghost" data-terminal-connect data-i18n="terminalConnect" title="">连接</button>
+              <button type="button" class="ghost" data-terminal-clear data-i18n="terminalClear" title="">清空</button>
+            </div>
+            <pre class="terminal-output" data-terminal-output role="log" aria-live="polite" tabindex="0"></pre>
+            <div class="terminal-input-row">
+              <span class="terminal-prompt" aria-hidden="true">$</span>
+              <input class="terminal-input" data-terminal-input type="text" autocomplete="off" autocapitalize="off" spellcheck="false" data-i18n-ph="terminalPlaceholder">
+              <button type="button" data-terminal-run data-i18n="terminalRun" title="">执行</button>
+            </div>
+            <div class="hint terminal-hint" data-i18n="terminalHint">命令将在容器内以当前用户执行。</div>
+          </div>`;
+        this.status = document.getElementById('terminalStatus');
+        this.cwd = this.querySelector('[data-terminal-cwd]');
+        this.output = this.querySelector('[data-terminal-output]');
+        this.input = this.querySelector('[data-terminal-input]');
+        this.connectButton = this.querySelector('[data-terminal-connect]');
+        this.clearButton = this.querySelector('[data-terminal-clear]');
+        this.runButton = this.querySelector('[data-terminal-run]');
+        this.connectButton.addEventListener('click', () => {
+          if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) this.disconnect();
+          else this.connect();
+        });
+        this.clearButton.addEventListener('click', () => this.clearOutput());
+        this.runButton.addEventListener('click', () => this.runCommand());
+        this.input.addEventListener('keydown', (ev) => this.handleKey(ev));
+        this.output.addEventListener('click', () => this.input.focus());
+        if (window.ResizeObserver) {
+          this.resizeObserver = new ResizeObserver(() => this.sendResize());
+          this.resizeObserver.observe(this.output);
+        } else {
+          this.resizeHandler = () => this.sendResize();
+          window.addEventListener('resize', this.resizeHandler);
+        }
+        this.setLanguage();
+        this.connect();
+      }
+      disconnectedCallback(){
+        this.disconnect();
+        if (this.resizeObserver) this.resizeObserver.disconnect();
+        if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler);
+      }
+      setLanguage(){
+        this.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.getAttribute('data-i18n')); });
+        this.querySelectorAll('[data-i18n-ph]').forEach((el) => { el.placeholder = t(el.getAttribute('data-i18n-ph')); });
+        this.updateControls();
+        if (this.status && this.statusText === null) {
+          this.status.textContent = t(this.statusKey);
+          this.status.className = 'badge ' + this.statusClass;
+        }
+      }
+      setStatus(key, cls, text){
+        this.statusKey = key;
+        this.statusClass = cls || 'warn';
+        this.statusText = text == null ? null : String(text);
+        if (!this.status) return;
+        this.status.textContent = this.statusText === null ? t(key) : this.statusText;
+        this.status.className = 'badge ' + this.statusClass;
+      }
+      updateControls(){
+        if (!this.connectButton) return;
+        var open = this.ws && this.ws.readyState === WebSocket.OPEN;
+        var connecting = this.ws && this.ws.readyState === WebSocket.CONNECTING;
+        this.connectButton.textContent = open ? t('terminalDisconnect') : t('terminalConnect');
+        this.connectButton.disabled = !!connecting;
+        this.connectButton.title = open ? t('terminalDisconnect') : t('terminalConnect');
+        this.clearButton.title = t('terminalClear');
+        this.runButton.title = t('terminalRun');
+      }
+      connect(){
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+        this.statusText = null;
+        this.setStatus('terminalConnecting', 'warn');
+        var scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        var ws;
+        try { ws = new WebSocket(scheme + location.host + '/__admin/api/terminal'); }
+        catch(e){
+          this.setStatus('terminalError', 'err', t('terminalError'));
+          this.appendOutput('\n[terminal] ' + e.message + '\n');
+          return;
+        }
+        this.ws = ws;
+        this.updateControls();
+        ws.addEventListener('open', () => {
+          if (this.ws !== ws) return;
+          this.setStatus('terminalConnected', 'ok');
+          this.updateControls();
+          this.sendResize();
+          this.flushPendingInput();
+          this.input.focus();
+        });
+        ws.addEventListener('message', (ev) => {
+          if (this.ws !== ws) return;
+          this.handleMessage(ev.data);
+        });
+        ws.addEventListener('error', () => {
+          if (this.ws !== ws) return;
+          this.setStatus('terminalError', 'err');
+          this.appendOutput('\n[terminal] ' + t('terminalError') + '\n');
+        });
+        ws.addEventListener('close', () => {
+          if (this.ws !== ws) return;
+          this.ws = null;
+          this.pendingInput = [];
+          this.setStatus('terminalDisconnected', 'warn');
+          this.updateControls();
+        });
+      }
+      disconnect(){
+        var ws = this.ws;
+        if (!ws) return;
+        this.ws = null;
+        this.pendingInput = [];
+        try {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'close' }));
+          ws.close();
+        } catch(e){}
+        this.setStatus('terminalDisconnected', 'warn');
+        this.updateControls();
+      }
+      handleMessage(raw){
+        var message;
+        try { message = JSON.parse(typeof raw === 'string' ? raw : String(raw)); }
+        catch(e){ return this.appendOutput(String(raw)); }
+        if (!message || typeof message !== 'object') return;
+        if (message.type === 'ready') {
+          this.cwd.textContent = message.cwd || '-';
+          this.cwd.title = message.cwd || '';
+          return;
+        }
+        if (message.type === 'output') return this.appendOutput(message.data || '');
+        if (message.type === 'error') {
+          this.appendOutput('\n[terminal] ' + (message.message || t('terminalError')) + '\n');
+          return this.setStatus('terminalError', 'err');
+        }
+        if (message.type === 'exit') {
+          this.appendOutput('\n[' + t('terminalExit') + ']\n');
+          this.setStatus('terminalDisconnected', 'warn');
+        }
+      }
+      send(data){
+        if (!this.ws || this.ws.readyState === WebSocket.CONNECTING) {
+          this.pendingInput.push(String(data));
+          if (!this.ws) this.connect();
+          return true;
+        }
+        if (this.ws.readyState !== WebSocket.OPEN) {
+          this.connect();
+          return false;
+        }
+        try {
+          this.ws.send(JSON.stringify({ type: 'input', data: data }));
+          return true;
+        } catch(e){
+          this.setStatus('terminalError', 'err');
+          return false;
+        }
+      }
+      flushPendingInput(){
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.pendingInput.length) return;
+        var pending = this.pendingInput.splice(0);
+        pending.forEach((data) => this.send(data));
+      }
+      sendResize(){
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.output) return;
+        var width = Math.max(240, this.output.clientWidth || 960);
+        var height = Math.max(120, this.output.clientHeight || 320);
+        var cols = Math.max(20, Math.min(300, Math.floor(width / 8)));
+        var rows = Math.max(5, Math.min(100, Math.floor(height / 20)));
+        try { this.ws.send(JSON.stringify({ type: 'resize', cols: cols, rows: rows })); } catch(e){}
+      }
+      runCommand(){
+        var value = this.input.value;
+        if (!value) return this.input.focus();
+        if (this.send(value + '\n')) this.input.value = '';
+        this.input.focus();
+      }
+      handleKey(ev){
+        var key = ev.key;
+        if (key === 'Enter') { ev.preventDefault(); return this.runCommand(); }
+        if (ev.ctrlKey && key.toLowerCase() === 'c') {
+          ev.preventDefault(); this.input.value = ''; return this.send('\u0003');
+        }
+        if (ev.ctrlKey && key.toLowerCase() === 'd') {
+          ev.preventDefault(); return this.send('\u0004');
+        }
+        if (ev.ctrlKey && key.toLowerCase() === 'l') {
+          ev.preventDefault(); return this.clearOutput();
+        }
+        var sequences = { ArrowUp: '\u001b[A', ArrowDown: '\u001b[B', ArrowRight: '\u001b[C', ArrowLeft: '\u001b[D', Home: '\u001b[H', End: '\u001b[F', Tab: '\t' };
+        if (sequences[key] && !ev.altKey && !ev.metaKey) {
+          ev.preventDefault();
+          return this.send(sequences[key]);
+        }
+      }
+      appendOutput(data){
+        if (!this.output || data == null) return;
+        var clean = String(data)
+          .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+          .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '');
+        this.output.textContent += clean;
+        if (this.output.textContent.length > 200000) this.output.textContent = this.output.textContent.slice(-160000);
+        this.output.scrollTop = this.output.scrollHeight;
+      }
+      clearOutput(){ if (this.output) this.output.textContent = ''; this.input && this.input.focus(); }
+    }
+    customElements.define('container-terminal', ContainerTerminal);
+  }
+
   function applyLang(l){
     lang = (l === 'en') ? 'en' : 'zh';
     T = LANGS[lang];
@@ -257,6 +527,8 @@
     for (var i = 0; i < els.length; i++) els[i].textContent = t(els[i].getAttribute('data-i18n'));
     var phs = document.querySelectorAll('[data-i18n-ph]');
     for (var j = 0; j < phs.length; j++) phs[j].placeholder = t(phs[j].getAttribute('data-i18n-ph'));
+    var terminal = $('containerTerminal');
+    if (terminal && typeof terminal.setLanguage === 'function') terminal.setLanguage();
     if (lastState) renderState(lastState);
   }
   $('btnLang').addEventListener('click', function(){ applyLang(lang === 'zh' ? 'en' : 'zh'); });
@@ -283,7 +555,7 @@
   log(t('logConnecting'));
 
   // ── registry 配置 ─────────────────────────────────────────
-  var lastSaved = null;
+  var lastRegistry = null;
   function renderRegistry(r){
     if (!r) return;
     var input = $('regInput');
@@ -294,10 +566,10 @@
       (r.saved ? t('regHintLast') + '<code>' + r.saved + '</code>' : '') +
       t('regHintEff') + '<code>' + (r.effective||'') + '</code>' +
       ' ｜ ' + t('regHintPriority') + ' ' + t('regHintNote');
-    lastSaved = r.saved;
+    lastRegistry = r;
   }
   $('btnRegUseDef').addEventListener('click', function(){
-    var r = lastSaved; // fallback to latest known registryInfo
+    var r = lastRegistry;
     if (r && r.default) $('regInput').value = r.default;
   });
   $('btnRegSave').addEventListener('click', async function(){

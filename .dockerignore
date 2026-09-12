@@ -1,6 +1,7 @@
 node_modules
 proxy/node_modules
 manager/node_modules
+/root
 .git
 *.log
 *.err

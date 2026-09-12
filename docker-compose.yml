@@ -1,0 +1,16 @@
+name: dsh
+services:
+    deepseek-harness:
+        container_name: deepseek-harness
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                DEV_TOOLS: admin
+        pull_policy: build
+        image: deepseek-harness:admin-local
+        ports:
+            - 3080:3080
+        volumes:
+            - ./root:/root
+        restart: unless-stopped
